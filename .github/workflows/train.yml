@@ -4,46 +4,39 @@ on:
   workflow_dispatch:
     inputs:
       recording_url_1:
-        description: 'rec_1774768169.jsonl 的下载 URL（从 Release Assets 复制）'
+        description: 'rec_1774768169.jsonl 的下载 URL'
         required: true
       recording_url_2:
-        description: 'rec_1774768807.jsonl 的下载 URL（从 Release Assets 复制）'
+        description: 'rec_1774768807.jsonl 的下载 URL'
         required: true
       epochs:
-        description: 'Epochs（建议 30）'
+        description: 'Epochs'
         default: '30'
         required: false
       batch_size:
-        description: 'Batch Size（建议 16）'
+        description: 'Batch Size'
         default: '16'
         required: false
 
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 180   # 最长 3 小时
+    timeout-minutes: 180
 
     steps:
 
-    # ── 1. 下载录音文件 ──────────────────────────────────────────────
     - name: Download recordings
       run: |
         mkdir -p data/recordings data/models
-        echo "Downloading recording 1..."
         wget -q --show-progress -O data/recordings/rec_1774768169.jsonl \
           "${{ github.event.inputs.recording_url_1 }}"
-        echo "Downloading recording 2..."
         wget -q --show-progress -O data/recordings/rec_1774768807.jsonl \
           "${{ github.event.inputs.recording_url_2 }}"
-        echo "=== Files ready ==="
         ls -lh data/recordings/
 
-    # ── 2. 拉取镜像并启动容器 ───────────────────────────────────────
-    - name: Pull Docker image
-      run: docker pull ruvnet/wifi-densepose:latest
-
-    - name: Start ruview container
+    - name: Pull and start ruview container
       run: |
+        docker pull ruvnet/wifi-densepose:latest
         docker run -d \
           --name ruview \
           -p 3000:3000 \
@@ -52,94 +45,51 @@ jobs:
           -e CSI_SOURCE=esp32 \
           -v ${{ github.workspace }}/data:/app/data \
           ruvnet/wifi-densepose:latest
-
-        echo "Waiting for HTTP server..."
+        echo "Waiting for server..."
         for i in $(seq 1 30); do
           if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
-            echo "✅ Server ready (${i}s)"
-            break
+            echo "Server ready"; break
           fi
           sleep 2
         done
+        docker logs ruview --tail 20
 
-    # ── 3. 探测 API 路由（调试用）──────────────────────────────────
-    - name: Discover API
+    - name: Start training via correct API endpoint
       run: |
-        echo "=== Server startup logs ==="
-        docker logs ruview
-        echo ""
-        echo "=== Probing common endpoints ==="
-        for ep in /api /api/recordings /api/train /api/training; do
-          echo -n "GET http://localhost:3000${ep} → "
-          curl -s -o /dev/null -w "%{http_code}" http://localhost:3000${ep} || echo "error"
-        done
-
-    # ── 4. 触发训练 ─────────────────────────────────────────────────
-    - name: Start training
-      run: |
-        PAYLOAD=$(cat <<EOF
-        {
-          "dataset_ids": ["rec_1774768169", "rec_1774768807"],
-          "config": {
-            "epochs": ${{ github.event.inputs.epochs }},
-            "batch_size": ${{ github.event.inputs.batch_size }},
-            "learning_rate": 0.0003,
-            "patience": 10
-          }
-        }
-        EOF
-        )
-
-        echo "Sending training request..."
-        # 依次尝试几个可能的端点
-        SUCCESS=false
-        for ep in /api/train /api/training/start /train /training/start; do
-          HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
-            -X POST "http://localhost:3000${ep}" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
-          echo "POST ${ep} → HTTP ${HTTP}"
-          cat /tmp/resp.json 2>/dev/null && echo ""
-          if [[ "$HTTP" == "200" || "$HTTP" == "201" || "$HTTP" == "202" ]]; then
-            echo "✅ Training triggered via ${ep}"
-            SUCCESS=true
-            break
-          fi
-        done
-
-        if [ "$SUCCESS" = false ]; then
-          echo "❌ Could not trigger training via REST API"
-          echo "Trying WebSocket approach..."
-          # 安装 websocat 备用
-          wget -q https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl \
-            -O /usr/local/bin/websocat && chmod +x /usr/local/bin/websocat
-          echo '{"type":"start_training","dataset_ids":["rec_1774768169","rec_1774768807"],"epochs":${{ github.event.inputs.epochs }},"batch_size":${{ github.event.inputs.batch_size }},"learning_rate":0.0003,"patience":10}' | \
-            timeout 10 websocat ws://localhost:3001/ws/sensing || true
+        EPOCHS="${{ github.event.inputs.epochs }}"
+        BATCH="${{ github.event.inputs.batch_size }}"
+        PAYLOAD="{\"dataset_ids\":[\"rec_1774768169\",\"rec_1774768807\"],\"config\":{\"epochs\":${EPOCHS},\"batch_size\":${BATCH},\"learning_rate\":0.0003,\"patience\":10}}"
+        echo "Payload: $PAYLOAD"
+        HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+          -X POST http://localhost:3000/api/v1/train/start \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD")
+        echo "HTTP $HTTP — $(cat /tmp/resp.json)"
+        if [[ "$HTTP" != "200" && "$HTTP" != "201" && "$HTTP" != "202" ]]; then
+          echo "Training trigger failed — probing endpoints:"
+          for ep in /api/v1/train/start /api/v1/train/status /api/v1/recording/list /health /api/health; do
+            echo -n "  $ep → "; curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000${ep}
+          done
+          exit 1
         fi
+        echo "Training started!"
 
-    # ── 5. 等待 .rvf 模型文件出现 ──────────────────────────────────
-    - name: Wait for training to complete
+    - name: Wait for model file
       run: |
-        echo "Polling for model file (max 150 min)..."
         for i in $(seq 1 150); do
           if ls data/models/*.rvf 2>/dev/null | grep -q .; then
-            echo ""
-            echo "✅ Model file found!"
-            ls -lh data/models/
-            exit 0
+            echo "Model found!"; ls -lh data/models/; exit 0
           fi
-          # 每分钟打印一次进度
-          echo "[$(date +%H:%M)] Minute ${i}/150 — waiting..."
-          docker logs ruview --tail 3 2>&1 | grep -E "Epoch|Training|Error|error" || true
+          STATUS=$(curl -s http://localhost:3000/api/v1/train/status 2>/dev/null || echo '{}')
+          EPOCH=$(echo "$STATUS" | grep -o '"epoch":[0-9]*' | head -1 | cut -d: -f2)
+          TOTAL=$(echo "$STATUS" | grep -o '"total_epochs":[0-9]*' | head -1 | cut -d: -f2)
+          LOSS=$(echo "$STATUS" | grep -o '"train_loss":[0-9.e+-]*' | head -1 | cut -d: -f2)
+          echo "[$(date +%H:%M)] Min ${i}/150 — Epoch ${EPOCH:-?}/${TOTAL:-?}  Loss: ${LOSS:---}"
           sleep 60
         done
-        echo "❌ Timed out after 150 minutes"
-        echo "=== Last 50 lines of docker logs ==="
-        docker logs ruview --tail 50
-        exit 1
+        echo "Timeout"; docker logs ruview --tail 50; exit 1
 
-    # ── 6. 上传模型为 Artifact（保留 90 天）────────────────────────
-    - name: Upload model artifact
+    - name: Upload model
       if: success()
       uses: actions/upload-artifact@v4
       with:
@@ -147,11 +97,10 @@ jobs:
         path: data/models/*.rvf
         retention-days: 90
 
-    # ── 7. 失败时也保存日志 ─────────────────────────────────────────
-    - name: Save logs on failure
+    - name: Save failure logs
       if: failure()
-      run: |
-        docker logs ruview > /tmp/ruview.log 2>&1 || true
+      run: docker logs ruview > /tmp/ruview.log 2>&1 || true
+
     - uses: actions/upload-artifact@v4
       if: failure()
       with:
